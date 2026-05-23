@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 
+from .degradation import random_degradation
+from .eafc import MultiScaleEAFC
 from .uiae import UIAE
 
 
@@ -27,30 +29,57 @@ def _trainer_arg(args: Any, name: str, default: Any) -> Any:
     return getattr(args, name, default)
 
 
-def _forward_with_uiae(self: nn.Module, x: Any, *args: Any, **kwargs: Any) -> Any:
-    """Run UIAE inside the YOLO forward path so DDP can track its gradients."""
+DETECT_FEATURE_LAYERS = (16, 19, 22)
+DETECT_FEATURE_CHANNELS = (256, 512, 512)
+
+
+def _forward_layers_until_detect(model: nn.Module, img: torch.Tensor) -> list[torch.Tensor | None]:
+    outputs: list[torch.Tensor | None] = []
+    x: Any = img
+    for module in model.model[:-1]:
+        if module.f != -1:
+            x = outputs[module.f] if isinstance(module.f, int) else [x if j == -1 else outputs[j] for j in module.f]
+        x = module(x)
+        outputs.append(x if module.i in model.save else None)
+    return outputs
+
+
+def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Tensor]:
+    enhanced, params = self.uiae(raw_img)
+    self.uiae_last_params = {key: value.detach() for key, value in params.items()}
+
+    if getattr(self, "eafc_enabled", False):
+        raw_outputs = _forward_layers_until_detect(self, raw_img)
+        enh_outputs = _forward_layers_until_detect(self, enhanced)
+        raw_features = [raw_outputs[i] for i in DETECT_FEATURE_LAYERS]
+        enh_features = [enh_outputs[i] for i in DETECT_FEATURE_LAYERS]
+        fused_features, attn = self.eafc(raw_features, enh_features)
+        self.eafc_last_attention = [value.detach() for value in attn]
+        preds = self.model[-1](fused_features)
+    else:
+        preds = self._aefc_base_forward(enhanced.clone())
+
+    identity = self.uiae.identity_params.to(dtype=params["all"].dtype, device=params["all"].device)
+    param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean()
+    cons_loss = (enhanced - raw_img).pow(2).mean()
+    aux_loss = self.uiae_lambda_param * param_loss + self.uiae_lambda_cons * cons_loss
+    return preds, aux_loss
+
+
+def _forward_with_aefc(self: nn.Module, x: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run UIAE and optional EAFC inside the YOLO forward path."""
 
     if isinstance(x, dict):
         if "img" not in x:
             return self._aefc_base_forward(x, *args, **kwargs)
         batch = dict(x)
-        raw_img = batch["img"]
-        enhanced, params = self.uiae(raw_img)
-        self.uiae_last_params = {key: value.detach() for key, value in params.items()}
-        batch["img"] = enhanced.clone()
-        out = self._aefc_base_forward(batch, *args, **kwargs)
-        if isinstance(out, tuple) and len(out) == 2 and torch.is_tensor(out[0]):
-            identity = self.uiae.identity_params.to(dtype=params["all"].dtype, device=params["all"].device)
-            param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean()
-            cons_loss = (enhanced - raw_img).pow(2).mean()
-            aux_loss = self.uiae_lambda_param * param_loss + self.uiae_lambda_cons * cons_loss
-            return out[0] + aux_loss, out[1]
-        return out
+        preds, aux_loss = _aefc_predict(self, batch["img"])
+        loss, loss_items = self.loss(batch, preds)
+        return loss + aux_loss, loss_items
 
     if torch.is_tensor(x):
-        enhanced, params = self.uiae(x)
-        self.uiae_last_params = {key: value.detach() for key, value in params.items()}
-        return self._aefc_base_forward(enhanced.clone(), *args, **kwargs)
+        preds, _ = _aefc_predict(self, x)
+        return preds
 
     return self._aefc_base_forward(x, *args, **kwargs)
 
@@ -63,6 +92,7 @@ class UIAETrainer(DetectionTrainer):
         self._disable_inplace_ops()
         self._freeze_batchnorm_stats()
         self._attach_uiae()
+        self._attach_eafc()
         self._wrap_forward()
         return ckpt
 
@@ -94,12 +124,28 @@ class UIAETrainer(DetectionTrainer):
         self.model.uiae_lambda_cons = float(_trainer_arg(self.args, "lambda_cons", 0.1))
         self.model.uiae_lambda_param = float(_trainer_arg(self.args, "lambda_param", 0.01))
 
+    def _attach_eafc(self) -> None:
+        if not bool(_trainer_arg(self.args, "use_eafc", False)):
+            return
+        if hasattr(self.model, "eafc"):
+            return
+        self.model.add_module("eafc", MultiScaleEAFC(DETECT_FEATURE_CHANNELS))
+        self.model.eafc_enabled = True
+
     def _wrap_forward(self) -> None:
         if hasattr(self.model, "_aefc_base_forward"):
             return
         self.model._aefc_base_forward = self.model.forward
-        self.model.forward = MethodType(_forward_with_uiae, self.model)
+        self.model.forward = MethodType(_forward_with_aefc, self.model)
 
     def preprocess_batch(self, batch: dict) -> dict:
         self._freeze_batchnorm_stats()
-        return super().preprocess_batch(batch)
+        batch = super().preprocess_batch(batch)
+        if bool(_trainer_arg(self.args, "use_mdct", False)):
+            p_degrade = float(_trainer_arg(self.args, "p_degrade", 0.5))
+            if torch.rand((), device=batch["img"].device).item() < p_degrade:
+                degraded, name = random_degradation(batch["img"])
+                batch["img"] = degraded
+                model = self.model.module if hasattr(self.model, "module") else self.model
+                model.uiae_last_degradation = name
+        return batch

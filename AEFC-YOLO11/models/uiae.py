@@ -70,7 +70,7 @@ class UIAE(nn.Module):
         self.kbl_dim = kbl_kernel_count * kbl_kernel_size * kbl_kernel_size * 3
         self.alpha_kbl = alpha_kbl
         blend_init = min(max(blend_init, 1e-4), 1.0 - 1e-4)
-        self.blend_logit = nn.Parameter(torch.tensor(torch.logit(torch.tensor(blend_init)), dtype=torch.float32))
+        self.blend_logit = nn.Parameter(torch.logit(torch.tensor(blend_init, dtype=torch.float32)))
         self.ppn = ParameterPredictor(out_dim=self.bpw_dim + self.kbl_dim, ppn_size=ppn_size)
         self._init_identity_parameters()
 

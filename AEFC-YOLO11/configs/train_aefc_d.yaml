@@ -1,0 +1,44 @@
+model: weights/yolo11m.pt
+data: configs/waterscenes_full.yaml
+imgsz: 1920
+epochs: 200
+batch: 32
+optimizer: AdamW
+lr0: 0.0005
+lrf: 0.01
+weight_decay: 0.0005
+momentum: 0.937
+warmup_epochs: 3
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+cos_lr: true
+workers: 8
+device: 0
+amp: false
+seed: 42
+project: runs/aefc_yolo11
+name: experiment_d_full_aefc
+log_interval: 100
+
+use_uiae: true
+use_eafc: true
+use_mdct: true
+
+uiae_ppn_size: 256
+uiae_kbl_kernel_size: 5
+uiae_kbl_kernel_count: 2
+uiae_alpha_kbl: 0.01
+uiae_blend_init: 0.02
+
+p_degrade: 0.35
+p_dark: 0.20
+p_fog: 0.20
+p_rain: 0.15
+p_blur: 0.10
+p_noise: 0.10
+p_reflection: 0.12
+
+lambda_cons: 1.0
+lambda_param: 0.1
+lambda_smooth: 0.005
+cons_start_epoch: 50

@@ -15,11 +15,11 @@ class EAFC(nn.Module):
         super().__init__()
         self.attn = nn.Sequential(
             nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.SiLU(inplace=True),
+            nn.GroupNorm(8, channels),
+            nn.SiLU(inplace=False),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.SiLU(inplace=True),
+            nn.GroupNorm(8, channels),
+            nn.SiLU(inplace=False),
             nn.Conv2d(channels, channels, kernel_size=1),
             nn.Sigmoid(),
         )

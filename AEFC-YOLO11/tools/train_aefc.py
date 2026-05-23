@@ -102,6 +102,7 @@ def parse_args() -> argparse.Namespace:
         default=2,
     )
     parser.add_argument("--uiae-alpha-kbl", "--uiae_alpha_kbl", dest="uiae_alpha_kbl", type=float, default=0.1)
+    parser.add_argument("--uiae-blend-init", "--uiae_blend_init", dest="uiae_blend_init", type=float, default=0.05)
     parser.add_argument("--lambda-cons", "--lambda_cons", dest="lambda_cons", type=float, default=0.1)
     parser.add_argument("--lambda-param", "--lambda_param", dest="lambda_param", type=float, default=0.01)
     parser.add_argument("--lambda-smooth", "--lambda_smooth", dest="lambda_smooth", type=float, default=0.005)
@@ -396,11 +397,8 @@ class FileTrainLogger:
 
 
 def assert_supported(args: argparse.Namespace) -> None:
-    if args.use_eafc or args.use_mdct:
-        raise SystemExit(
-            "EAFC/MDCT are not wired into the Ultralytics training graph yet. "
-            "For B-group ablation, run --use-uiae only."
-        )
+    if (args.use_eafc or args.use_mdct) and not args.use_uiae:
+        raise SystemExit("EAFC/MDCT currently use the AEFC trainer path. Enable --use-uiae together with them.")
 
 
 def main() -> None:
