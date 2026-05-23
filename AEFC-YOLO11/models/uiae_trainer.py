@@ -9,7 +9,6 @@ import torch
 from torch import nn
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 
-from .degradation import random_degradation
 from .uiae import UIAE
 
 
@@ -103,11 +102,4 @@ class UIAETrainer(DetectionTrainer):
 
     def preprocess_batch(self, batch: dict) -> dict:
         self._freeze_batchnorm_stats()
-        batch = super().preprocess_batch(batch)
-        if bool(_trainer_arg(self.args, "use_mdct", False)):
-            p_degrade = float(_trainer_arg(self.args, "p_degrade", 0.5))
-            if torch.rand((), device=batch["img"].device).item() < p_degrade:
-                degraded, name = random_degradation(batch["img"])
-                batch["img"] = degraded
-                self.model.uiae_last_degradation = name
-        return batch
+        return super().preprocess_batch(batch)

@@ -396,13 +396,11 @@ class FileTrainLogger:
 
 
 def assert_supported(args: argparse.Namespace) -> None:
-    if args.use_eafc:
+    if args.use_eafc or args.use_mdct:
         raise SystemExit(
-            "EAFC is implemented as a standalone module but is not wired into the Ultralytics YOLO11 feature graph yet. "
-            "Run UIAE/MDCT experiments first, or wire EAFC into the YOLO neck before enabling --use-eafc."
+            "EAFC/MDCT are not wired into the Ultralytics training graph yet. "
+            "For B-group ablation, run --use-uiae only."
         )
-    if args.use_mdct and not args.use_uiae:
-        raise SystemExit("MDCT currently uses the UIAETrainer data path. Enable --use-uiae together with --use-mdct.")
 
 
 def main() -> None:
