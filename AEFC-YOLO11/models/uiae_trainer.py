@@ -45,7 +45,11 @@ def _forward_layers_until_detect(model: nn.Module, img: torch.Tensor) -> list[to
 
 
 def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Tensor]:
-    enhanced, params = self.uiae(raw_img)
+    if getattr(self, "uiae_frozen", False):
+        with torch.no_grad():
+            enhanced, params = self.uiae(raw_img)
+    else:
+        enhanced, params = self.uiae(raw_img)
     self.uiae_last_params = {key: value.detach() for key, value in params.items()}
 
     if getattr(self, "eafc_enabled", False):
@@ -60,9 +64,13 @@ def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Te
         preds = self._aefc_base_forward(enhanced.clone())
 
     identity = self.uiae.identity_params.to(dtype=params["all"].dtype, device=params["all"].device)
-    param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean()
-    cons_loss = (enhanced - raw_img).pow(2).mean()
-    aux_loss = self.uiae_lambda_param * param_loss + self.uiae_lambda_cons * cons_loss
+    param_loss = (params["all"].detach() - identity.unsqueeze(0)).pow(2).mean()
+    cons_loss = (enhanced.detach() - raw_img.detach()).pow(2).mean()
+    aux_loss = raw_img.new_tensor(0.0)
+    if not getattr(self, "uiae_frozen", False):
+        param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean()
+        cons_loss = (enhanced - raw_img).pow(2).mean()
+        aux_loss = self.uiae_lambda_param * param_loss + self.uiae_lambda_cons * cons_loss
     return preds, aux_loss
 
 
@@ -121,6 +129,11 @@ class UIAETrainer(DetectionTrainer):
         )
         self.model.add_module("uiae", uiae)
         self.model.uiae_enabled = True
+        self.model.uiae_frozen = bool(_trainer_arg(self.args, "freeze_uiae", False))
+        if self.model.uiae_frozen:
+            self.model.uiae.eval()
+            for param in self.model.uiae.parameters():
+                param.requires_grad = False
         self.model.uiae_lambda_cons = float(_trainer_arg(self.args, "lambda_cons", 0.1))
         self.model.uiae_lambda_param = float(_trainer_arg(self.args, "lambda_param", 0.01))
 
@@ -129,7 +142,8 @@ class UIAETrainer(DetectionTrainer):
             return
         if hasattr(self.model, "eafc"):
             return
-        self.model.add_module("eafc", MultiScaleEAFC(DETECT_FEATURE_CHANNELS))
+        alpha_init = float(_trainer_arg(self.args, "eafc_alpha_init", 0.02))
+        self.model.add_module("eafc", MultiScaleEAFC(DETECT_FEATURE_CHANNELS, alpha_init=alpha_init))
         self.model.eafc_enabled = True
 
     def _wrap_forward(self) -> None:

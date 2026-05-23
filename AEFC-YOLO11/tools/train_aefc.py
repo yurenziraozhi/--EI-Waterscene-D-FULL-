@@ -103,6 +103,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--uiae-alpha-kbl", "--uiae_alpha_kbl", dest="uiae_alpha_kbl", type=float, default=0.1)
     parser.add_argument("--uiae-blend-init", "--uiae_blend_init", dest="uiae_blend_init", type=float, default=0.05)
+    parser.add_argument("--freeze-uiae", "--freeze_uiae", dest="freeze_uiae", type=str2bool, default=False)
+    parser.add_argument("--eafc-alpha-init", "--eafc_alpha_init", dest="eafc_alpha_init", type=float, default=0.02)
     parser.add_argument("--lambda-cons", "--lambda_cons", dest="lambda_cons", type=float, default=0.1)
     parser.add_argument("--lambda-param", "--lambda_param", dest="lambda_param", type=float, default=0.01)
     parser.add_argument("--lambda-smooth", "--lambda_smooth", dest="lambda_smooth", type=float, default=0.005)
