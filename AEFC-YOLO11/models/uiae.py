@@ -55,6 +55,7 @@ class UIAE(nn.Module):
         kbl_kernel_size: int = 5,
         kbl_kernel_count: int = 2,
         alpha_kbl: float = 0.1,
+        blend_init: float = 0.05,
         mode: str = "uiae",
     ) -> None:
         super().__init__()
@@ -68,6 +69,8 @@ class UIAE(nn.Module):
         self.kbl_kernel_count = kbl_kernel_count
         self.kbl_dim = kbl_kernel_count * kbl_kernel_size * kbl_kernel_size * 3
         self.alpha_kbl = alpha_kbl
+        blend_init = min(max(blend_init, 1e-4), 1.0 - 1e-4)
+        self.blend_logit = nn.Parameter(torch.tensor(torch.logit(torch.tensor(blend_init)), dtype=torch.float32))
         self.ppn = ParameterPredictor(out_dim=self.bpw_dim + self.kbl_dim, ppn_size=ppn_size)
         self._init_identity_parameters()
 
@@ -137,8 +140,11 @@ class UIAE(nn.Module):
         else:
             x_bpw = self._bpw_filter(x, bpw_params)
             x_enh = self._kbl_filter(x_bpw, kbl_params)
+        blend = torch.sigmoid(self.blend_logit)
+        x_enh = x + blend * (x_enh - x)
         return x_enh, {
             "all": params,
             "bpw": bpw_params,
             "kbl": kbl_params,
+            "blend": blend.reshape(1),
         }

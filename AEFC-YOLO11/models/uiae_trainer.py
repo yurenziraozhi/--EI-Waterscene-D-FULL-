@@ -75,6 +75,7 @@ class UIAETrainer(DetectionTrainer):
             kbl_kernel_size=int(_trainer_arg(self.args, "uiae_kbl_kernel_size", 5)),
             kbl_kernel_count=int(_trainer_arg(self.args, "uiae_kbl_kernel_count", 2)),
             alpha_kbl=float(_trainer_arg(self.args, "uiae_alpha_kbl", 0.1)),
+            blend_init=float(_trainer_arg(self.args, "uiae_blend_init", 0.05)),
             mode="uiae",
         )
         self.model.add_module("uiae", uiae)
