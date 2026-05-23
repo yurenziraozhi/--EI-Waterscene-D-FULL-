@@ -12,6 +12,17 @@ from ultralytics.models.yolo.detect.train import DetectionTrainer
 from .uiae import UIAE
 
 
+_ORIGINAL_DDP = nn.parallel.DistributedDataParallel
+
+
+def _ddp_find_unused_parameters(*args: Any, **kwargs: Any) -> nn.Module:
+    kwargs["find_unused_parameters"] = True
+    return _ORIGINAL_DDP(*args, **kwargs)
+
+
+nn.parallel.DistributedDataParallel = _ddp_find_unused_parameters
+
+
 def _trainer_arg(args: Any, name: str, default: Any) -> Any:
     return getattr(args, name, default)
 
