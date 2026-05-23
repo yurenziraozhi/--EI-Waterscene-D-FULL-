@@ -1,0 +1,35 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local OS/editor artifacts
+.DS_Store
+Thumbs.db
+~$*
+*.tmp
+*.docx
+
+# WaterScenes raw data and generated YOLO datasets
+image/
+detection/
+adverse_lighting/
+adverse_weather/
+AEFC-YOLO11/datasets/
+
+# Training/evaluation outputs
+runs/
+logs/
+AEFC-YOLO11/runs/
+AEFC-YOLO11/logs/
+yolo11m_baseline*/
+*.nohup.out
+
+# Model weights/checkpoints
+AEFC-YOLO11/weights/*.pt
+AEFC-YOLO11/weights/*.pth
+AEFC-YOLO11/weights/*.onnx
+*.pt
+*.pth
+*.onnx

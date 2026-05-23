@@ -1,0 +1,35 @@
+model: weights/yolo11m.pt
+data: configs/waterscenes_full.yaml
+imgsz: 640
+epochs: 200
+batch: 16
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+weight_decay: 0.0005
+momentum: 0.937
+warmup_epochs: 3
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+cos_lr: true
+workers: 8
+device: 0
+amp: false
+seed: 42
+project: runs/aefc_yolo11
+name: yolo11m_baseline
+log_interval: 100
+
+robust_aug: true
+p_degrade: 0.67
+p_dark: 0.20
+p_fog: 0.20
+p_rain: 0.15
+p_blur: 0.10
+p_noise: 0.10
+p_reflection: 0.12
+
+lambda_cons: 0.1
+lambda_param: 0.01
+lambda_smooth: 0.005
+cons_start_epoch: 50

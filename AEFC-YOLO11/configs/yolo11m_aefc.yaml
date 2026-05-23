@@ -1,0 +1,16 @@
+# Placeholder model config for the AEFC-YOLO11-M implementation.
+# The first runnable milestone should train `yolo11m.pt` as baseline.
+# UIAE/EAFC modules live under models/ and are wired by tools/train_aefc.py.
+base_model: yolo11m.pt
+use_uiae: true
+use_eafc: true
+use_mdct: true
+uiae:
+  ppn_size: 256
+  bpw_dim: 12
+  kbl_kernel_size: 5
+  kbl_kernel_count: 2
+  kbl_dim: 150
+  alpha_kbl: 0.1
+eafc:
+  scales: [3, 4, 5]

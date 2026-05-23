@@ -1,0 +1,13 @@
+path: waterscenes_yolo
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: pier
+  1: buoy
+  2: sailor
+  3: ship
+  4: boat
+  5: vessel
+  6: kayak
