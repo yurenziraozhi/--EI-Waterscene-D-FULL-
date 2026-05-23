@@ -30,6 +30,8 @@ yolo11m_baseline*/
 AEFC-YOLO11/weights/*.pt
 AEFC-YOLO11/weights/*.pth
 AEFC-YOLO11/weights/*.onnx
+!AEFC-YOLO11/weights/yolo11m.pt
 *.pt
 *.pth
 *.onnx
+!AEFC-YOLO11/weights/yolo11m.pt
