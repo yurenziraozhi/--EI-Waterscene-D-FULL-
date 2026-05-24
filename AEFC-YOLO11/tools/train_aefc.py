@@ -163,6 +163,15 @@ class FileTrainLogger:
                     "map50_95",
                     "fitness",
                     "lr",
+                    "uiae_blend",
+                    "enh_delta_absmax",
+                    "enh_delta_mean",
+                    "eafc_p3_alpha_mean",
+                    "eafc_p4_alpha_mean",
+                    "eafc_p5_alpha_mean",
+                    "pred_absmax",
+                    "pred_zero_fraction",
+                    "diag_alert",
                 ],
             )
             self._csv_writer.writeheader()
@@ -265,6 +274,50 @@ class FileTrainLogger:
         tloss = getattr(trainer, "tloss", None)
         if tloss is not None:
             payload["train_loss_running"] = self._tensor_to_float(tloss)
+        payload.update(self._diagnostics_payload(trainer))
+        return payload
+
+    @staticmethod
+    def _unwrapped_model(obj: Any) -> Any:
+        model = getattr(obj, "model", None)
+        if model is None:
+            return None
+        return model.module if hasattr(model, "module") else model
+
+    @staticmethod
+    def _metric_value(metrics: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    def _diagnostics_payload(self, trainer: Any) -> dict[str, Any]:
+        model = self._unwrapped_model(trainer)
+        if model is None:
+            return {}
+        diagnostics = getattr(model, "aefc_last_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            return {}
+        alerts: list[str] = []
+        for key in ("input_finite", "enhanced_finite", "pred_finite"):
+            if diagnostics.get(key) is False:
+                alerts.append(key.replace("_finite", "_nonfinite"))
+        pred_absmax = diagnostics.get("pred_absmax")
+        if isinstance(pred_absmax, (int, float)) and pred_absmax == 0:
+            alerts.append("pred_all_zero")
+        pred_zero = diagnostics.get("pred_zero_fraction")
+        if isinstance(pred_zero, (int, float)) and pred_zero > 0.98:
+            alerts.append("pred_mostly_zero")
+        enh_absmax = diagnostics.get("enh_delta_absmax")
+        if isinstance(enh_absmax, (int, float)) and enh_absmax > 0.5:
+            alerts.append("enh_delta_large")
+        payload = {
+            "diagnostics": diagnostics,
+            "last_degradation": getattr(model, "uiae_last_degradation", "unknown"),
+        }
+        if alerts:
+            payload["diag_alert"] = alerts
         return payload
 
     def on_train_start(self, trainer: Any) -> None:
@@ -337,12 +390,22 @@ class FileTrainLogger:
                 obj = getattr(metrics_obj, root, None)
                 if obj is not None and hasattr(obj, leaf):
                     metrics[name] = getattr(obj, leaf)
+        map50 = self._metric_value(metrics, "metrics/mAP50(B)", "box.map50")
+        map5095 = self._metric_value(metrics, "metrics/mAP50-95(B)", "box.map")
+        alerts: list[str] = []
+        if map50 == 0.0:
+            alerts.append("val_map50_zero")
+        if map5095 == 0.0:
+            alerts.append("val_map50_95_zero")
+        event_payload = {
+            "epoch": None if epoch is None else int(epoch) + 1,
+            "metrics": metrics,
+        }
+        if alerts:
+            event_payload["diag_alert"] = alerts
         self.write(
             "val_end",
-            {
-                "epoch": None if epoch is None else int(epoch) + 1,
-                "metrics": metrics,
-            },
+            event_payload,
         )
         self.write_epoch_csv(validator, metrics)
 
@@ -395,6 +458,21 @@ class FileTrainLogger:
             "fitness": metrics.get("fitness", ""),
             "lr": self._first_number(lr_value) if lr_value is not None else "",
         }
+        diag = self._diagnostics_payload(trainer)
+        diagnostics = diag.get("diagnostics", {}) if isinstance(diag, dict) else {}
+        row.update(
+            {
+                "uiae_blend": diagnostics.get("uiae_blend", ""),
+                "enh_delta_absmax": diagnostics.get("enh_delta_absmax", ""),
+                "enh_delta_mean": diagnostics.get("enh_delta_mean", ""),
+                "eafc_p3_alpha_mean": diagnostics.get("eafc_p3_alpha_mean", ""),
+                "eafc_p4_alpha_mean": diagnostics.get("eafc_p4_alpha_mean", ""),
+                "eafc_p5_alpha_mean": diagnostics.get("eafc_p5_alpha_mean", ""),
+                "pred_absmax": diagnostics.get("pred_absmax", ""),
+                "pred_zero_fraction": diagnostics.get("pred_zero_fraction", ""),
+                "diag_alert": ";".join(diag.get("diag_alert", [])) if isinstance(diag, dict) else "",
+            }
+        )
         self._csv_writer.writerow(row)
 
 

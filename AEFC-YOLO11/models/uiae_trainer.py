@@ -33,6 +33,53 @@ DETECT_FEATURE_LAYERS = (16, 19, 22)
 DETECT_FEATURE_CHANNELS = (256, 512, 512)
 
 
+def _tensor_stats(prefix: str, value: torch.Tensor) -> dict[str, float | bool]:
+    tensor = value.detach()
+    finite = torch.isfinite(tensor)
+    if not bool(finite.all()):
+        tensor = tensor[finite]
+    if tensor.numel() == 0:
+        return {
+            f"{prefix}_finite": False,
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_std": float("nan"),
+            f"{prefix}_min": float("nan"),
+            f"{prefix}_max": float("nan"),
+            f"{prefix}_absmax": float("nan"),
+        }
+    tensor = tensor.float()
+    return {
+        f"{prefix}_finite": bool(finite.all()),
+        f"{prefix}_mean": float(tensor.mean().cpu()),
+        f"{prefix}_std": float(tensor.std(unbiased=False).cpu()),
+        f"{prefix}_min": float(tensor.min().cpu()),
+        f"{prefix}_max": float(tensor.max().cpu()),
+        f"{prefix}_absmax": float(tensor.abs().max().cpu()),
+    }
+
+
+def _prediction_stats(preds: Any) -> dict[str, float | bool | int]:
+    tensors: list[torch.Tensor] = []
+
+    def collect(value: Any) -> None:
+        if torch.is_tensor(value):
+            tensors.append(value.detach())
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(preds)
+    if not tensors:
+        return {"pred_tensor_count": 0}
+    flat = torch.cat([tensor.float().reshape(-1) for tensor in tensors if tensor.numel() > 0])
+    if flat.numel() == 0:
+        return {"pred_tensor_count": len(tensors), "pred_empty": True}
+    stats = _tensor_stats("pred", flat)
+    stats["pred_tensor_count"] = len(tensors)
+    stats["pred_zero_fraction"] = float((flat == 0).float().mean().cpu())
+    return stats
+
+
 def _forward_layers_until_detect(model: nn.Module, img: torch.Tensor) -> list[torch.Tensor | None]:
     outputs: list[torch.Tensor | None] = []
     x: Any = img
@@ -51,6 +98,13 @@ def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Te
     else:
         enhanced, params = self.uiae(raw_img)
     self.uiae_last_params = {key: value.detach() for key, value in params.items()}
+    diagnostics: dict[str, Any] = {}
+    diagnostics.update(_tensor_stats("input", raw_img))
+    diagnostics.update(_tensor_stats("enhanced", enhanced))
+    diagnostics.update(_tensor_stats("enh_delta", enhanced - raw_img))
+    blend = params.get("blend")
+    if blend is not None:
+        diagnostics["uiae_blend"] = float(blend.detach().float().mean().cpu())
 
     if getattr(self, "eafc_enabled", False):
         raw_outputs = _forward_layers_until_detect(self, raw_img)
@@ -59,9 +113,19 @@ def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Te
         enh_features = [enh_outputs[i] for i in DETECT_FEATURE_LAYERS]
         fused_features, attn = self.eafc(raw_features, enh_features)
         self.eafc_last_attention = [value.detach() for value in attn]
+        for idx, (raw_feature, enh_feature, fused_feature, attn_map) in enumerate(
+            zip(raw_features, enh_features, fused_features, attn),
+            start=3,
+        ):
+            diagnostics[f"eafc_p{idx}_alpha_mean"] = float(attn_map.detach().float().mean().cpu())
+            diagnostics[f"eafc_p{idx}_alpha_min"] = float(attn_map.detach().float().min().cpu())
+            diagnostics[f"eafc_p{idx}_alpha_max"] = float(attn_map.detach().float().max().cpu())
+            diagnostics[f"eafc_p{idx}_delta_l1"] = float((enh_feature - raw_feature).detach().abs().mean().cpu())
+            diagnostics[f"eafc_p{idx}_fused_delta_l1"] = float((fused_feature - raw_feature).detach().abs().mean().cpu())
         preds = self.model[-1](fused_features)
     else:
         preds = self._aefc_base_forward(enhanced.clone())
+    diagnostics.update(_prediction_stats(preds))
 
     identity = self.uiae.identity_params.to(dtype=params["all"].dtype, device=params["all"].device)
     param_loss = (params["all"].detach() - identity.unsqueeze(0)).pow(2).mean()
@@ -71,6 +135,10 @@ def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Te
         param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean()
         cons_loss = (enhanced - raw_img).pow(2).mean()
         aux_loss = self.uiae_lambda_param * param_loss + self.uiae_lambda_cons * cons_loss
+    diagnostics["uiae_param_mse"] = float(param_loss.detach().cpu())
+    diagnostics["uiae_cons_mse"] = float(cons_loss.detach().cpu())
+    diagnostics["aux_loss"] = float(aux_loss.detach().cpu())
+    self.aefc_last_diagnostics = diagnostics
     return preds, aux_loss
 
 
@@ -155,11 +223,12 @@ class UIAETrainer(DetectionTrainer):
     def preprocess_batch(self, batch: dict) -> dict:
         self._freeze_batchnorm_stats()
         batch = super().preprocess_batch(batch)
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        model.uiae_last_degradation = "none"
         if bool(_trainer_arg(self.args, "use_mdct", False)):
             p_degrade = float(_trainer_arg(self.args, "p_degrade", 0.5))
             if torch.rand((), device=batch["img"].device).item() < p_degrade:
                 degraded, name = random_degradation(batch["img"])
                 batch["img"] = degraded
-                model = self.model.module if hasattr(self.model, "module") else self.model
                 model.uiae_last_degradation = name
         return batch
