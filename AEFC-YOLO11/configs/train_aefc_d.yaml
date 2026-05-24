@@ -29,7 +29,8 @@ uiae_kbl_kernel_size: 5
 uiae_kbl_kernel_count: 2
 uiae_alpha_kbl: 0.01
 uiae_blend_init: 0.02
-freeze_uiae: true
+freeze_uiae: false
+freeze_uiae_epochs: 3
 eafc_alpha_init: 0.02
 
 p_degrade: 0.20

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import csv
+import json
+import os
 from types import MethodType
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 from ultralytics.models.yolo.detect.train import DetectionTrainer
+from ultralytics.utils.torch_utils import unwrap_model
 
 from .degradation import random_degradation
 from .eafc import MultiScaleEAFC
@@ -163,6 +169,17 @@ def _forward_with_aefc(self: nn.Module, x: Any, *args: Any, **kwargs: Any) -> An
 class UIAETrainer(DetectionTrainer):
     """DetectionTrainer that enhances normalized images before YOLO forward."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._diag_batch_i = 0
+        self._diag_log_fp = None
+        self._diag_csv_fp = None
+        self._diag_csv = None
+        self._setup_internal_logging()
+        self.add_callback("on_train_batch_end", self._log_train_batch)
+        self.add_callback("on_fit_epoch_end", self._log_fit_epoch)
+        self.add_callback("teardown", self._close_internal_logging)
+
     def setup_model(self) -> dict | None:
         ckpt = super().setup_model()
         self._disable_inplace_ops()
@@ -171,6 +188,16 @@ class UIAETrainer(DetectionTrainer):
         self._attach_eafc()
         self._wrap_forward()
         return ckpt
+
+    def build_optimizer(self, model: nn.Module, name: str = "auto", lr: float = 0.001, momentum: float = 0.9,
+                        decay: float = 1e-5, iterations: float = 1e5):
+        if bool(_trainer_arg(self.args, "train_eafc_only", False)):
+            unwrapped = unwrap_model(model)
+            for param_name, param in unwrapped.named_parameters():
+                param.requires_grad = param_name.startswith("eafc.")
+            trainable = [param for param in unwrapped.parameters() if param.requires_grad]
+            return torch.optim.AdamW(trainable, lr=lr, betas=(momentum, 0.999), weight_decay=decay)
+        return super().build_optimizer(model, name=name, lr=lr, momentum=momentum, decay=decay, iterations=iterations)
 
     def _disable_inplace_ops(self) -> None:
         for module in self.model.modules():
@@ -197,7 +224,11 @@ class UIAETrainer(DetectionTrainer):
         )
         self.model.add_module("uiae", uiae)
         self.model.uiae_enabled = True
-        self.model.uiae_frozen = bool(_trainer_arg(self.args, "freeze_uiae", False))
+        freeze_epochs = int(_trainer_arg(self.args, "freeze_uiae_epochs", 0))
+        if bool(_trainer_arg(self.args, "freeze_uiae", False)):
+            freeze_epochs = max(freeze_epochs, int(_trainer_arg(self.args, "epochs", 200)) + 1)
+        self.model.uiae_freeze_epochs = freeze_epochs
+        self.model.uiae_frozen = self.model.uiae_freeze_epochs > 0
         if self.model.uiae_frozen:
             self.model.uiae.eval()
             for param in self.model.uiae.parameters():
@@ -214,6 +245,176 @@ class UIAETrainer(DetectionTrainer):
         self.model.add_module("eafc", MultiScaleEAFC(DETECT_FEATURE_CHANNELS, alpha_init=alpha_init))
         self.model.eafc_enabled = True
 
+    @staticmethod
+    def _is_rank0() -> bool:
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "-1"))
+        return rank in {"-1", "0"}
+
+    def _setup_internal_logging(self) -> None:
+        if not self._is_rank0():
+            return
+        log_file = _trainer_arg(self.args, "log_file", None)
+        log_dir = Path(str(_trainer_arg(self.args, "log_dir", "logs")))
+        name = str(_trainer_arg(self.args, "name", "aefc_train")).replace("/", "_").replace("\\", "_")
+        self._diag_log_path = Path(str(log_file)) if log_file else log_dir / f"{name}.log"
+        self._diag_csv_path = log_dir / f"{name}_epoch_metrics.csv"
+        self._diag_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._diag_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self._diag_log_fp = self._diag_log_path.open("w", encoding="utf-8", buffering=1)
+        self._diag_csv_fp = self._diag_csv_path.open("w", encoding="utf-8", newline="", buffering=1)
+        self._diag_csv = csv.DictWriter(
+            self._diag_csv_fp,
+            fieldnames=[
+                "epoch",
+                "box_loss",
+                "cls_loss",
+                "dfl_loss",
+                "precision",
+                "recall",
+                "map50",
+                "map50_95",
+                "fitness",
+                "uiae_blend",
+                "enh_delta_absmax",
+                "eafc_p3_alpha_mean",
+                "eafc_p4_alpha_mean",
+                "eafc_p5_alpha_mean",
+                "pred_absmax",
+                "pred_zero_fraction",
+                "diag_alert",
+            ],
+        )
+        self._diag_csv.writeheader()
+        self._write_diag("trainer_log_start", {"log_file": str(self._diag_log_path), "csv_file": str(self._diag_csv_path)})
+
+    def _close_internal_logging(self, *_: Any, **__: Any) -> None:
+        if self._diag_log_fp is not None:
+            self._diag_log_fp.close()
+            self._diag_log_fp = None
+        if self._diag_csv_fp is not None:
+            self._diag_csv_fp.close()
+            self._diag_csv_fp = None
+
+    def _write_diag(self, event: str, payload: dict[str, Any]) -> None:
+        if self._diag_log_fp is None:
+            return
+        record = {"time": datetime.now().isoformat(timespec="seconds"), "event": event, **payload}
+        self._diag_log_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _float_value(value: Any) -> float | str:
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return float(value.detach().cpu())
+            return str([float(v) for v in value.detach().flatten().cpu().tolist()])
+        if isinstance(value, (int, float)):
+            return float(value)
+        return "" if value is None else str(value)
+
+    def _diag_alerts(self, diagnostics: dict[str, Any], metrics: dict[str, Any] | None = None) -> list[str]:
+        alerts: list[str] = []
+        for key in ("input_finite", "enhanced_finite", "pred_finite"):
+            if diagnostics.get(key) is False:
+                alerts.append(key.replace("_finite", "_nonfinite"))
+        pred_zero = diagnostics.get("pred_zero_fraction")
+        if isinstance(pred_zero, (int, float)) and pred_zero > 0.98:
+            alerts.append("pred_mostly_zero")
+        pred_absmax = diagnostics.get("pred_absmax")
+        if isinstance(pred_absmax, (int, float)) and pred_absmax == 0:
+            alerts.append("pred_all_zero")
+        if metrics:
+            if metrics.get("metrics/mAP50(B)", metrics.get("box.map50")) == 0:
+                alerts.append("val_map50_zero")
+            if metrics.get("metrics/mAP50-95(B)", metrics.get("box.map")) == 0:
+                alerts.append("val_map50_95_zero")
+        return alerts
+
+    def _current_loss_items(self) -> dict[str, Any]:
+        loss_items = getattr(self, "loss_items", None)
+        if loss_items is None:
+            return {}
+        values = loss_items.detach().flatten().cpu().tolist() if torch.is_tensor(loss_items) else loss_items
+        if isinstance(values, list):
+            keys = ["box_loss", "cls_loss", "dfl_loss"]
+            return {key: values[idx] for idx, key in enumerate(keys) if idx < len(values)}
+        return {"loss_items": self._float_value(values)}
+
+    def _log_train_batch(self, *_: Any, **__: Any) -> None:
+        total = len(self.train_loader) if getattr(self, "train_loader", None) is not None else None
+        interval = max(1, int(_trainer_arg(self.args, "log_interval", 100)))
+        if self._diag_batch_i != 1 and self._diag_batch_i % interval != 0 and self._diag_batch_i != total:
+            return
+        model = unwrap_model(self.model)
+        diagnostics = getattr(model, "aefc_last_diagnostics", {})
+        payload = {
+            "epoch": int(getattr(self, "epoch", 0)) + 1,
+            "batch": self._diag_batch_i,
+            "total_batches": total,
+            "loss": self._float_value(getattr(self, "loss", None)),
+            "loss_items": self._current_loss_items(),
+            "last_degradation": getattr(model, "uiae_last_degradation", "unknown"),
+            "diagnostics": diagnostics,
+        }
+        alerts = self._diag_alerts(diagnostics)
+        if alerts:
+            payload["diag_alert"] = alerts
+        self._write_diag("train_batch", payload)
+
+    def _maybe_update_freeze_state(self) -> None:
+        model = unwrap_model(self.model)
+        freeze_epochs = int(getattr(model, "uiae_freeze_epochs", 0))
+        should_freeze = int(getattr(self, "epoch", 0)) < freeze_epochs
+        if getattr(model, "uiae_frozen", False) == should_freeze:
+            return
+        model.uiae_frozen = should_freeze
+        for param in model.uiae.parameters():
+            param.requires_grad = not should_freeze
+        if should_freeze:
+            model.uiae.eval()
+        else:
+            model.uiae.train()
+        self._write_diag(
+            "freeze_state_update",
+            {"epoch": int(getattr(self, "epoch", 0)) + 1, "uiae_frozen": should_freeze},
+        )
+
+    def _log_fit_epoch(self, *_: Any, **__: Any) -> None:
+        metrics = self.metrics if isinstance(self.metrics, dict) else {}
+        model = unwrap_model(self.model)
+        diagnostics = getattr(model, "aefc_last_diagnostics", {})
+        alerts = self._diag_alerts(diagnostics, metrics)
+        payload = {
+            "epoch": int(getattr(self, "epoch", 0)) + 1,
+            "metrics": metrics,
+            "diagnostics": diagnostics,
+        }
+        if alerts:
+            payload["diag_alert"] = alerts
+        self._write_diag("fit_epoch_end", payload)
+        if self._diag_csv is not None:
+            loss_items = self._current_loss_items()
+            self._diag_csv.writerow(
+                {
+                    "epoch": int(getattr(self, "epoch", 0)) + 1,
+                    "box_loss": loss_items.get("box_loss", ""),
+                    "cls_loss": loss_items.get("cls_loss", ""),
+                    "dfl_loss": loss_items.get("dfl_loss", ""),
+                    "precision": metrics.get("metrics/precision(B)", metrics.get("box.mp", "")),
+                    "recall": metrics.get("metrics/recall(B)", metrics.get("box.mr", "")),
+                    "map50": metrics.get("metrics/mAP50(B)", metrics.get("box.map50", "")),
+                    "map50_95": metrics.get("metrics/mAP50-95(B)", metrics.get("box.map", "")),
+                    "fitness": metrics.get("fitness", ""),
+                    "uiae_blend": diagnostics.get("uiae_blend", ""),
+                    "enh_delta_absmax": diagnostics.get("enh_delta_absmax", ""),
+                    "eafc_p3_alpha_mean": diagnostics.get("eafc_p3_alpha_mean", ""),
+                    "eafc_p4_alpha_mean": diagnostics.get("eafc_p4_alpha_mean", ""),
+                    "eafc_p5_alpha_mean": diagnostics.get("eafc_p5_alpha_mean", ""),
+                    "pred_absmax": diagnostics.get("pred_absmax", ""),
+                    "pred_zero_fraction": diagnostics.get("pred_zero_fraction", ""),
+                    "diag_alert": ";".join(alerts),
+                }
+            )
+
     def _wrap_forward(self) -> None:
         if hasattr(self.model, "_aefc_base_forward"):
             return
@@ -222,6 +423,8 @@ class UIAETrainer(DetectionTrainer):
 
     def preprocess_batch(self, batch: dict) -> dict:
         self._freeze_batchnorm_stats()
+        self._maybe_update_freeze_state()
+        self._diag_batch_i += 1
         batch = super().preprocess_batch(batch)
         model = self.model.module if hasattr(self.model, "module") else self.model
         model.uiae_last_degradation = "none"
