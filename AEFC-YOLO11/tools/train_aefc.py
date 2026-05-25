@@ -110,6 +110,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-param", "--lambda_param", dest="lambda_param", type=float, default=0.01)
     parser.add_argument("--lambda-smooth", "--lambda_smooth", dest="lambda_smooth", type=float, default=0.005)
     parser.add_argument("--cons-start-epoch", "--cons_start_epoch", dest="cons_start_epoch", type=int, default=50)
+    parser.add_argument("--mdct-start-epoch", "--mdct_start_epoch", dest="mdct_start_epoch", type=int, default=0)
+    parser.add_argument("--mdct-warmup-epochs", "--mdct_warmup_epochs", dest="mdct_warmup_epochs", type=int, default=0)
+    parser.add_argument("--freeze-detector", "--freeze_detector", dest="freeze_detector", type=str2bool, default=False)
+    parser.add_argument("--freeze-backbone", "--freeze_backbone", dest="freeze_backbone", type=str2bool, default=False)
+    parser.add_argument(
+        "--condition-aware-enhancement",
+        "--condition_aware_enhancement",
+        dest="condition_aware_enhancement",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--adverse-lighting-list",
+        "--adverse_lighting_list",
+        dest="adverse_lighting_list",
+        type=Path,
+        default=Path("adverse_lighting.txt"),
+    )
+    parser.add_argument(
+        "--adverse-weather-list",
+        "--adverse_weather_list",
+        dest="adverse_weather_list",
+        type=Path,
+        default=Path("adverse_weather.txt"),
+    )
 
     parser.set_defaults(**cfg)
     args = parser.parse_args(remaining)
@@ -172,6 +197,19 @@ class FileTrainLogger:
                     "eafc_p5_alpha_mean",
                     "pred_absmax",
                     "pred_zero_fraction",
+                    "uiae_trainable_params",
+                    "uiae_grad_norm",
+                    "uiae_has_grad",
+                    "eafc_trainable_params",
+                    "eafc_grad_norm",
+                    "eafc_has_grad",
+                    "mdct_effective_p",
+                    "condition_aware",
+                    "adverse_fraction",
+                    "adverse_count",
+                    "normal_count",
+                    "enh_delta_adverse_mean",
+                    "enh_delta_normal_mean",
                     "diag_alert",
                 ],
             )
@@ -230,6 +268,22 @@ class FileTrainLogger:
                     "uiae": self.args.use_uiae,
                     "eafc": self.args.use_eafc,
                     "mdct": self.args.use_mdct,
+                },
+                "aefc_training": {
+                    "freeze_uiae": self.args.freeze_uiae,
+                    "freeze_uiae_epochs": self.args.freeze_uiae_epochs,
+                    "uiae_blend_init": self.args.uiae_blend_init,
+                    "eafc_alpha_init": self.args.eafc_alpha_init,
+                    "p_degrade": getattr(self.args, "p_degrade", None),
+                    "mdct_start_epoch": self.args.mdct_start_epoch,
+                    "mdct_warmup_epochs": self.args.mdct_warmup_epochs,
+                    "freeze_detector": self.args.freeze_detector,
+                    "freeze_backbone": self.args.freeze_backbone,
+                    "condition_aware_enhancement": self.args.condition_aware_enhancement,
+                    "adverse_lighting_list": self.args.adverse_lighting_list,
+                    "adverse_weather_list": self.args.adverse_weather_list,
+                    "lambda_cons": self.args.lambda_cons,
+                    "lambda_param": self.args.lambda_param,
                 },
             },
         )
@@ -471,6 +525,19 @@ class FileTrainLogger:
                 "eafc_p5_alpha_mean": diagnostics.get("eafc_p5_alpha_mean", ""),
                 "pred_absmax": diagnostics.get("pred_absmax", ""),
                 "pred_zero_fraction": diagnostics.get("pred_zero_fraction", ""),
+                "uiae_trainable_params": diagnostics.get("uiae_trainable_params", ""),
+                "uiae_grad_norm": diagnostics.get("uiae_grad_norm", ""),
+                "uiae_has_grad": diagnostics.get("uiae_has_grad", ""),
+                "eafc_trainable_params": diagnostics.get("eafc_trainable_params", ""),
+                "eafc_grad_norm": diagnostics.get("eafc_grad_norm", ""),
+                "eafc_has_grad": diagnostics.get("eafc_has_grad", ""),
+                "mdct_effective_p": diagnostics.get("mdct_effective_p", ""),
+                "condition_aware": diagnostics.get("condition_aware", ""),
+                "adverse_fraction": diagnostics.get("adverse_fraction", ""),
+                "adverse_count": diagnostics.get("adverse_count", ""),
+                "normal_count": diagnostics.get("normal_count", ""),
+                "enh_delta_adverse_mean": diagnostics.get("enh_delta_adverse_mean", ""),
+                "enh_delta_normal_mean": diagnostics.get("enh_delta_normal_mean", ""),
                 "diag_alert": ";".join(diag.get("diag_alert", [])) if isinstance(diag, dict) else "",
             }
         )
@@ -482,9 +549,51 @@ def assert_supported(args: argparse.Namespace) -> None:
         raise SystemExit("EAFC/MDCT currently use the AEFC trainer path. Enable --use-uiae together with them.")
 
 
+def export_aefc_env_args(args: argparse.Namespace) -> None:
+    custom_keys = [
+        "use_uiae",
+        "use_eafc",
+        "use_mdct",
+        "uiae_ppn_size",
+        "uiae_kbl_kernel_size",
+        "uiae_kbl_kernel_count",
+        "uiae_alpha_kbl",
+        "uiae_blend_init",
+        "freeze_uiae",
+        "freeze_uiae_epochs",
+        "eafc_alpha_init",
+        "p_degrade",
+        "p_dark",
+        "p_fog",
+        "p_rain",
+        "p_blur",
+        "p_noise",
+        "p_reflection",
+        "lambda_cons",
+        "lambda_param",
+        "lambda_smooth",
+        "cons_start_epoch",
+        "mdct_start_epoch",
+        "mdct_warmup_epochs",
+        "freeze_detector",
+        "freeze_backbone",
+        "condition_aware_enhancement",
+        "adverse_lighting_list",
+        "adverse_weather_list",
+        "log_dir",
+        "log_file",
+        "log_interval",
+        "name",
+        "epochs",
+    ]
+    payload = {key: to_serializable(getattr(args, key)) for key in custom_keys if hasattr(args, key)}
+    os.environ["AEFC_TRAIN_ARGS"] = json.dumps(payload, ensure_ascii=False)
+
+
 def main() -> None:
     args = parse_args()
     assert_supported(args)
+    export_aefc_env_args(args)
 
     try:
         from ultralytics import YOLO

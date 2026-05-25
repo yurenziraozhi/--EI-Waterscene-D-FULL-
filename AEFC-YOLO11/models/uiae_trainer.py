@@ -1,4 +1,4 @@
-"""Ultralytics trainer for the UIAE-only ablation."""
+"""Ultralytics trainer for AEFC full and ablation experiments."""
 
 from __future__ import annotations
 
@@ -21,6 +21,9 @@ from .uiae import UIAE
 
 
 _ORIGINAL_DDP = nn.parallel.DistributedDataParallel
+_AEFC_ENV_ARGS: dict[str, Any] | None = None
+_ADVERSE_IDS: set[str] | None = None
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _ddp_find_unused_parameters(*args: Any, **kwargs: Any) -> nn.Module:
@@ -32,7 +35,86 @@ nn.parallel.DistributedDataParallel = _ddp_find_unused_parameters
 
 
 def _trainer_arg(args: Any, name: str, default: Any) -> Any:
-    return getattr(args, name, default)
+    global _AEFC_ENV_ARGS
+    if hasattr(args, name):
+        return getattr(args, name)
+    if _AEFC_ENV_ARGS is None:
+        raw = os.environ.get("AEFC_TRAIN_ARGS", "{}")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {}
+        _AEFC_ENV_ARGS = parsed if isinstance(parsed, dict) else {}
+    return _AEFC_ENV_ARGS.get(name, default)
+
+
+def _normalize_image_id(value: str) -> str:
+    value = value.strip().replace("\\", "/")
+    if not value:
+        return ""
+    return Path(value).name.lower()
+
+
+def _candidate_image_ids(value: str) -> set[str]:
+    value = value.strip().replace("\\", "/")
+    if not value:
+        return set()
+    path = Path(value)
+    candidates = {
+        value.lower(),
+        path.name.lower(),
+        path.stem.lower(),
+    }
+    parts = value.lower().split("/")
+    if len(parts) >= 2:
+        candidates.add("/".join(parts[-2:]))
+    return {item for item in candidates if item}
+
+
+def _resolve_project_path(value: Any) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _read_id_list(path: Path) -> set[str]:
+    ids: set[str] = set()
+    if not path.exists():
+        return ids
+    with path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            ids.update(_candidate_image_ids(text.split()[0]))
+    return ids
+
+
+def _load_adverse_ids(args: Any) -> set[str]:
+    global _ADVERSE_IDS
+    if _ADVERSE_IDS is not None:
+        return _ADVERSE_IDS
+    ids: set[str] = set()
+    for key in ("adverse_lighting_list", "adverse_weather_list"):
+        value = _trainer_arg(args, key, None)
+        if value:
+            ids.update(_read_id_list(_resolve_project_path(value)))
+    _ADVERSE_IDS = ids
+    return ids
+
+
+def _adverse_mask_from_files(model: nn.Module, im_files: Any, batch_size: int, device: torch.device) -> torch.Tensor:
+    if not getattr(model, "condition_aware_enhancement", False):
+        return torch.ones(batch_size, 1, 1, 1, dtype=torch.float32, device=device)
+    adverse_ids = getattr(model, "adverse_image_ids", set())
+    if not im_files:
+        model.uiae_condition_available = False
+        return torch.ones(batch_size, 1, 1, 1, dtype=torch.float32, device=device)
+    mask_values = []
+    for im_file in im_files:
+        candidates = _candidate_image_ids(str(im_file))
+        mask_values.append(1.0 if candidates & adverse_ids else 0.0)
+    model.uiae_condition_available = True
+    return torch.tensor(mask_values, dtype=torch.float32, device=device).view(batch_size, 1, 1, 1)
 
 
 DETECT_FEATURE_LAYERS = (16, 19, 22)
@@ -61,6 +143,45 @@ def _tensor_stats(prefix: str, value: torch.Tensor) -> dict[str, float | bool]:
         f"{prefix}_min": float(tensor.min().cpu()),
         f"{prefix}_max": float(tensor.max().cpu()),
         f"{prefix}_absmax": float(tensor.abs().max().cpu()),
+    }
+
+
+def _module_train_stats(prefix: str, module: nn.Module) -> dict[str, float | int | bool]:
+    total_params = 0
+    trainable_params = 0
+    param_sq = 0.0
+    grad_sq = 0.0
+    grad_params = 0
+    for param in module.parameters():
+        total_params += param.numel()
+        param_sq += float(param.detach().float().pow(2).sum().cpu())
+        if param.requires_grad:
+            trainable_params += param.numel()
+        if param.grad is not None and torch.isfinite(param.grad).all():
+            grad_sq += float(param.grad.detach().float().pow(2).sum().cpu())
+            grad_params += param.numel()
+    return {
+        f"{prefix}_params": total_params,
+        f"{prefix}_trainable_params": trainable_params,
+        f"{prefix}_param_norm": param_sq**0.5,
+        f"{prefix}_grad_params": grad_params,
+        f"{prefix}_grad_norm": grad_sq**0.5,
+        f"{prefix}_has_grad": grad_params > 0,
+    }
+
+
+def _named_trainable_stats(prefix: str, module: nn.Module, skip_prefixes: tuple[str, ...] = ()) -> dict[str, int]:
+    total_params = 0
+    trainable_params = 0
+    for name, param in module.named_parameters():
+        if skip_prefixes and name.startswith(skip_prefixes):
+            continue
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    return {
+        f"{prefix}_params": total_params,
+        f"{prefix}_trainable_params": trainable_params,
     }
 
 
@@ -100,22 +221,40 @@ def _forward_layers_until_detect(model: nn.Module, img: torch.Tensor) -> list[to
 def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Tensor]:
     if getattr(self, "uiae_frozen", False):
         with torch.no_grad():
-            enhanced, params = self.uiae(raw_img)
+            enhanced_raw, params = self.uiae(raw_img)
     else:
-        enhanced, params = self.uiae(raw_img)
+        enhanced_raw, params = self.uiae(raw_img)
+    adverse_mask = getattr(self, "uiae_adverse_mask", None)
+    if adverse_mask is None or adverse_mask.shape[0] != raw_img.shape[0]:
+        adverse_mask = raw_img.new_ones(raw_img.shape[0], 1, 1, 1)
+    adverse_mask = adverse_mask.to(dtype=raw_img.dtype, device=raw_img.device)
+    enhanced = raw_img + adverse_mask * (enhanced_raw - raw_img)
     self.uiae_last_params = {key: value.detach() for key, value in params.items()}
     diagnostics: dict[str, Any] = {}
     diagnostics.update(_tensor_stats("input", raw_img))
     diagnostics.update(_tensor_stats("enhanced", enhanced))
     diagnostics.update(_tensor_stats("enh_delta", enhanced - raw_img))
+    diagnostics["condition_aware"] = bool(getattr(self, "condition_aware_enhancement", False))
+    diagnostics["condition_available"] = bool(getattr(self, "uiae_condition_available", False))
+    diagnostics["adverse_fraction"] = float(adverse_mask.detach().mean().cpu())
+    diagnostics["adverse_count"] = int(adverse_mask.detach().sum().cpu())
+    diagnostics["normal_count"] = int(adverse_mask.numel() - adverse_mask.detach().sum().cpu())
+    delta_per_image = (enhanced_raw - raw_img).detach().abs().flatten(1).mean(dim=1)
+    flat_mask = adverse_mask.detach().flatten()
+    if bool((flat_mask > 0).any()):
+        diagnostics["enh_delta_adverse_mean"] = float(delta_per_image[flat_mask > 0].mean().cpu())
+    if bool((flat_mask == 0).any()):
+        diagnostics["enh_delta_normal_mean"] = float(delta_per_image[flat_mask == 0].mean().cpu())
+    diagnostics["mdct_effective_p"] = float(getattr(self, "uiae_mdct_effective_p", 0.0))
     blend = params.get("blend")
     if blend is not None:
         diagnostics["uiae_blend"] = float(blend.detach().float().mean().cpu())
 
     if getattr(self, "eafc_enabled", False):
-        raw_outputs = _forward_layers_until_detect(self, raw_img)
+        with torch.no_grad():
+            raw_outputs = _forward_layers_until_detect(self, raw_img)
         enh_outputs = _forward_layers_until_detect(self, enhanced)
-        raw_features = [raw_outputs[i] for i in DETECT_FEATURE_LAYERS]
+        raw_features = [raw_outputs[i].detach() for i in DETECT_FEATURE_LAYERS]
         enh_features = [enh_outputs[i] for i in DETECT_FEATURE_LAYERS]
         fused_features, attn = self.eafc(raw_features, enh_features)
         self.eafc_last_attention = [value.detach() for value in attn]
@@ -134,12 +273,26 @@ def _aefc_predict(self: nn.Module, raw_img: torch.Tensor) -> tuple[Any, torch.Te
     diagnostics.update(_prediction_stats(preds))
 
     identity = self.uiae.identity_params.to(dtype=params["all"].dtype, device=params["all"].device)
-    param_loss = (params["all"].detach() - identity.unsqueeze(0)).pow(2).mean()
-    cons_loss = (enhanced.detach() - raw_img.detach()).pow(2).mean()
+    per_image_param_loss = (params["all"].detach() - identity.unsqueeze(0)).pow(2).mean(dim=1)
+    per_image_cons_loss = (enhanced_raw.detach() - raw_img.detach()).pow(2).flatten(1).mean(dim=1)
+    normal_weight = (1.0 - adverse_mask.detach().flatten()).to(dtype=per_image_param_loss.dtype)
+    if bool((normal_weight > 0).any()):
+        param_loss = (per_image_param_loss * normal_weight).sum() / normal_weight.sum().clamp_min(1.0)
+        cons_loss = (per_image_cons_loss * normal_weight).sum() / normal_weight.sum().clamp_min(1.0)
+    else:
+        param_loss = per_image_param_loss.mean() * 0.0
+        cons_loss = per_image_cons_loss.mean() * 0.0
     aux_loss = raw_img.new_tensor(0.0)
     if not getattr(self, "uiae_frozen", False):
-        param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean()
-        cons_loss = (enhanced - raw_img).pow(2).mean()
+        per_image_param_loss = (params["all"] - identity.unsqueeze(0)).pow(2).mean(dim=1)
+        per_image_cons_loss = (enhanced_raw - raw_img).pow(2).flatten(1).mean(dim=1)
+        normal_weight = (1.0 - adverse_mask.flatten()).to(dtype=per_image_param_loss.dtype)
+        if bool((normal_weight > 0).any()):
+            param_loss = (per_image_param_loss * normal_weight).sum() / normal_weight.sum().clamp_min(1.0)
+            cons_loss = (per_image_cons_loss * normal_weight).sum() / normal_weight.sum().clamp_min(1.0)
+        else:
+            param_loss = per_image_param_loss.mean() * 0.0
+            cons_loss = per_image_cons_loss.mean() * 0.0
         aux_loss = self.uiae_lambda_param * param_loss + self.uiae_lambda_cons * cons_loss
     diagnostics["uiae_param_mse"] = float(param_loss.detach().cpu())
     diagnostics["uiae_cons_mse"] = float(cons_loss.detach().cpu())
@@ -189,16 +342,6 @@ class UIAETrainer(DetectionTrainer):
         self._wrap_forward()
         return ckpt
 
-    def build_optimizer(self, model: nn.Module, name: str = "auto", lr: float = 0.001, momentum: float = 0.9,
-                        decay: float = 1e-5, iterations: float = 1e5):
-        if bool(_trainer_arg(self.args, "train_eafc_only", False)):
-            unwrapped = unwrap_model(model)
-            for param_name, param in unwrapped.named_parameters():
-                param.requires_grad = param_name.startswith("eafc.")
-            trainable = [param for param in unwrapped.parameters() if param.requires_grad]
-            return torch.optim.AdamW(trainable, lr=lr, betas=(momentum, 0.999), weight_decay=decay)
-        return super().build_optimizer(model, name=name, lr=lr, momentum=momentum, decay=decay, iterations=iterations)
-
     def _disable_inplace_ops(self) -> None:
         for module in self.model.modules():
             if hasattr(module, "inplace"):
@@ -231,10 +374,22 @@ class UIAETrainer(DetectionTrainer):
         self.model.uiae_frozen = self.model.uiae_freeze_epochs > 0
         if self.model.uiae_frozen:
             self.model.uiae.eval()
+        if bool(_trainer_arg(self.args, "freeze_uiae", False)):
             for param in self.model.uiae.parameters():
                 param.requires_grad = False
         self.model.uiae_lambda_cons = float(_trainer_arg(self.args, "lambda_cons", 0.1))
         self.model.uiae_lambda_param = float(_trainer_arg(self.args, "lambda_param", 0.01))
+        self.model.condition_aware_enhancement = bool(_trainer_arg(self.args, "condition_aware_enhancement", False))
+        self.model.adverse_image_ids = set()
+        self.model.uiae_condition_available = False
+        if self.model.condition_aware_enhancement:
+            adverse_ids = _load_adverse_ids(self.args)
+            if not adverse_ids:
+                raise FileNotFoundError(
+                    "condition_aware_enhancement=True but no adverse image ids were loaded. "
+                    "Check adverse_lighting_list/adverse_weather_list paths."
+                )
+            self.model.adverse_image_ids = adverse_ids
 
     def _attach_eafc(self) -> None:
         if not bool(_trainer_arg(self.args, "use_eafc", False)):
@@ -242,8 +397,53 @@ class UIAETrainer(DetectionTrainer):
         if hasattr(self.model, "eafc"):
             return
         alpha_init = float(_trainer_arg(self.args, "eafc_alpha_init", 0.02))
-        self.model.add_module("eafc", MultiScaleEAFC(DETECT_FEATURE_CHANNELS, alpha_init=alpha_init))
+        try:
+            eafc = MultiScaleEAFC(DETECT_FEATURE_CHANNELS, alpha_init=alpha_init)
+        except TypeError:
+            eafc = MultiScaleEAFC(DETECT_FEATURE_CHANNELS)
+            for block in getattr(eafc, "blocks", []):
+                if hasattr(block, "_init_near_raw"):
+                    block._init_near_raw(alpha_init)
         self.model.eafc_enabled = True
+        self.model.add_module("eafc", eafc)
+
+    def _apply_trainable_policy(self, model: nn.Module) -> None:
+        freeze_detector = bool(_trainer_arg(self.args, "freeze_detector", False))
+        freeze_backbone = bool(_trainer_arg(self.args, "freeze_backbone", False))
+        if not freeze_detector and not freeze_backbone:
+            model.detector_frozen = False
+            model.backbone_frozen = False
+            return
+        for name, param in model.named_parameters():
+            if name.startswith(("uiae.", "eafc.")):
+                param.requires_grad = True
+            elif freeze_detector:
+                param.requires_grad = False
+            elif freeze_backbone:
+                param.requires_grad = name.startswith("model.23.")
+        model.detector_frozen = freeze_detector
+        model.backbone_frozen = freeze_backbone
+
+    def build_optimizer(
+        self,
+        model: nn.Module,
+        name: str = "auto",
+        lr: float = 0.001,
+        momentum: float = 0.9,
+        decay: float = 1e-5,
+        iterations: float = 1e5,
+    ):
+        unwrapped = unwrap_model(model)
+        self._apply_trainable_policy(unwrapped)
+        if bool(_trainer_arg(self.args, "freeze_detector", False)) or bool(_trainer_arg(self.args, "freeze_backbone", False)):
+            trainable = [param for param in unwrapped.parameters() if param.requires_grad]
+            return torch.optim.AdamW(trainable, lr=lr, betas=(momentum, 0.999), weight_decay=decay)
+        if bool(_trainer_arg(self.args, "train_eafc_only", False)):
+            for param_name, param in unwrapped.named_parameters():
+                param.requires_grad = param_name.startswith("eafc.")
+            trainable = [param for param in unwrapped.parameters() if param.requires_grad]
+            return torch.optim.AdamW(trainable, lr=lr, betas=(momentum, 0.999), weight_decay=decay)
+        return super().build_optimizer(model, name=name, lr=lr, momentum=momentum, decay=decay, iterations=iterations)
 
     @staticmethod
     def _is_rank0() -> bool:
@@ -281,6 +481,19 @@ class UIAETrainer(DetectionTrainer):
                 "eafc_p5_alpha_mean",
                 "pred_absmax",
                 "pred_zero_fraction",
+                "uiae_trainable_params",
+                "uiae_grad_norm",
+                "uiae_has_grad",
+                "eafc_trainable_params",
+                "eafc_grad_norm",
+                "eafc_has_grad",
+                "mdct_effective_p",
+                "condition_aware",
+                "adverse_fraction",
+                "adverse_count",
+                "normal_count",
+                "enh_delta_adverse_mean",
+                "enh_delta_normal_mean",
                 "diag_alert",
             ],
         )
@@ -322,6 +535,12 @@ class UIAETrainer(DetectionTrainer):
         pred_absmax = diagnostics.get("pred_absmax")
         if isinstance(pred_absmax, (int, float)) and pred_absmax == 0:
             alerts.append("pred_all_zero")
+        if diagnostics.get("uiae_trainable_params") == 0:
+            alerts.append("uiae_not_trainable")
+        if diagnostics.get("eafc_trainable_params") == 0:
+            alerts.append("eafc_not_trainable")
+        if diagnostics.get("condition_aware") and diagnostics.get("condition_available") is False:
+            alerts.append("condition_mask_unavailable")
         if metrics:
             if metrics.get("metrics/mAP50(B)", metrics.get("box.map50")) == 0:
                 alerts.append("val_map50_zero")
@@ -346,6 +565,14 @@ class UIAETrainer(DetectionTrainer):
             return
         model = unwrap_model(self.model)
         diagnostics = getattr(model, "aefc_last_diagnostics", {})
+        if hasattr(model, "uiae"):
+            diagnostics.update(_module_train_stats("uiae", model.uiae))
+        if hasattr(model, "eafc"):
+            diagnostics.update(_module_train_stats("eafc", model.eafc))
+        diagnostics["mdct_effective_p"] = float(getattr(model, "uiae_mdct_effective_p", 0.0))
+        diagnostics["detector_frozen"] = bool(getattr(model, "detector_frozen", False))
+        diagnostics["backbone_frozen"] = bool(getattr(model, "backbone_frozen", False))
+        diagnostics.update(_named_trainable_stats("detector", model, skip_prefixes=("uiae.", "eafc.")))
         payload = {
             "epoch": int(getattr(self, "epoch", 0)) + 1,
             "batch": self._diag_batch_i,
@@ -367,8 +594,6 @@ class UIAETrainer(DetectionTrainer):
         if getattr(model, "uiae_frozen", False) == should_freeze:
             return
         model.uiae_frozen = should_freeze
-        for param in model.uiae.parameters():
-            param.requires_grad = not should_freeze
         if should_freeze:
             model.uiae.eval()
         else:
@@ -382,6 +607,14 @@ class UIAETrainer(DetectionTrainer):
         metrics = self.metrics if isinstance(self.metrics, dict) else {}
         model = unwrap_model(self.model)
         diagnostics = getattr(model, "aefc_last_diagnostics", {})
+        if hasattr(model, "uiae"):
+            diagnostics.update(_module_train_stats("uiae", model.uiae))
+        if hasattr(model, "eafc"):
+            diagnostics.update(_module_train_stats("eafc", model.eafc))
+        diagnostics["mdct_effective_p"] = float(getattr(model, "uiae_mdct_effective_p", 0.0))
+        diagnostics["detector_frozen"] = bool(getattr(model, "detector_frozen", False))
+        diagnostics["backbone_frozen"] = bool(getattr(model, "backbone_frozen", False))
+        diagnostics.update(_named_trainable_stats("detector", model, skip_prefixes=("uiae.", "eafc.")))
         alerts = self._diag_alerts(diagnostics, metrics)
         payload = {
             "epoch": int(getattr(self, "epoch", 0)) + 1,
@@ -411,6 +644,19 @@ class UIAETrainer(DetectionTrainer):
                     "eafc_p5_alpha_mean": diagnostics.get("eafc_p5_alpha_mean", ""),
                     "pred_absmax": diagnostics.get("pred_absmax", ""),
                     "pred_zero_fraction": diagnostics.get("pred_zero_fraction", ""),
+                    "uiae_trainable_params": diagnostics.get("uiae_trainable_params", ""),
+                    "uiae_grad_norm": diagnostics.get("uiae_grad_norm", ""),
+                    "uiae_has_grad": diagnostics.get("uiae_has_grad", ""),
+                    "eafc_trainable_params": diagnostics.get("eafc_trainable_params", ""),
+                    "eafc_grad_norm": diagnostics.get("eafc_grad_norm", ""),
+                    "eafc_has_grad": diagnostics.get("eafc_has_grad", ""),
+                    "mdct_effective_p": diagnostics.get("mdct_effective_p", ""),
+                    "condition_aware": diagnostics.get("condition_aware", ""),
+                    "adverse_fraction": diagnostics.get("adverse_fraction", ""),
+                    "adverse_count": diagnostics.get("adverse_count", ""),
+                    "normal_count": diagnostics.get("normal_count", ""),
+                    "enh_delta_adverse_mean": diagnostics.get("enh_delta_adverse_mean", ""),
+                    "enh_delta_normal_mean": diagnostics.get("enh_delta_normal_mean", ""),
                     "diag_alert": ";".join(alerts),
                 }
             )
@@ -427,10 +673,27 @@ class UIAETrainer(DetectionTrainer):
         self._diag_batch_i += 1
         batch = super().preprocess_batch(batch)
         model = self.model.module if hasattr(self.model, "module") else self.model
+        model.uiae_adverse_mask = _adverse_mask_from_files(
+            model,
+            batch.get("im_file"),
+            int(batch["img"].shape[0]),
+            batch["img"].device,
+        )
         model.uiae_last_degradation = "none"
+        model.uiae_mdct_effective_p = 0.0
         if bool(_trainer_arg(self.args, "use_mdct", False)):
             p_degrade = float(_trainer_arg(self.args, "p_degrade", 0.5))
-            if torch.rand((), device=batch["img"].device).item() < p_degrade:
+            start_epoch = int(_trainer_arg(self.args, "mdct_start_epoch", 0))
+            warmup_epochs = max(0, int(_trainer_arg(self.args, "mdct_warmup_epochs", 0)))
+            epoch = int(getattr(self, "epoch", 0))
+            if epoch < start_epoch:
+                effective_p = 0.0
+            elif warmup_epochs > 0:
+                effective_p = p_degrade * min(1.0, float(epoch - start_epoch + 1) / float(warmup_epochs))
+            else:
+                effective_p = p_degrade
+            model.uiae_mdct_effective_p = effective_p
+            if torch.rand((), device=batch["img"].device).item() < effective_p:
                 degraded, name = random_degradation(batch["img"])
                 batch["img"] = degraded
                 model.uiae_last_degradation = name
