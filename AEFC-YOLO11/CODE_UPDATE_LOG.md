@@ -18,6 +18,142 @@ GitHub 推送备注:
 结果/后续观察:
 ```
 
+## 2026-05-25 D-core condition-aware fix3
+
+版本/实验：
+
+```text
+experiment_d_uiae_eafc_condition_aware_960_unfrozen_fix3
+```
+
+触发问题：
+
+```text
+baseline_yolo11m_960 在相同 imgsz=960 下收敛很快并明显强于 D fix2；主要差异是 baseline 全模型训练，而 D fix2 冻结了 backbone，只训练检测头、UIAE 和 EAFC。
+```
+
+修复内容：
+
+```text
+1. 将 freeze_backbone 从 true 改为 false，使 D 组和 baseline 一样允许 backbone/neck/head 全模型适应 WaterScenes。
+2. 将 lr0 从 0.0001 降到 0.00005，降低 UIAE/EAFC 与全模型联合训练初期震荡。
+3. 保持 model=weights/yolo11m.pt、imgsz=960、batch=32、use_uiae=true、use_eafc=true、use_mdct=false、condition_aware_enhancement=true。
+4. 继续使用 adverse_lighting.txt/adverse_weather.txt 对正常图和恶劣图进行硬标签门控。
+```
+
+涉及文件：
+
+```text
+AEFC-YOLO11/configs/train_aefc_d.yaml
+AEFC-YOLO11/CODE_UPDATE_LOG.md
+```
+
+服务器需要上传：
+
+```text
+configs/train_aefc_d.yaml
+CODE_UPDATE_LOG.md
+```
+
+推荐训练命令：
+
+```bash
+cd ~/autodl-tmp/鲁棒检测-EI/AEFC-YOLO11
+mkdir -p logs
+
+PYTHONPATH="$(pwd):${PYTHONPATH:-}" nohup python tools/train_aefc.py \
+  --cfg configs/train_aefc_d.yaml \
+  --device 0,1,2,3 \
+  --project runs/aefc_yolo11 \
+  --name experiment_d_uiae_eafc_condition_aware_960_unfrozen_fix3 \
+  --log-dir logs \
+  --log-interval 100 \
+  --log-file logs/experiment_d_uiae_eafc_condition_aware_960_unfrozen_fix3.log \
+  --save-period -1 \
+  --plots false \
+  > logs/experiment_d_uiae_eafc_condition_aware_960_unfrozen_fix3.nohup.out 2>&1 &
+```
+
+GitHub 推送备注：
+
+```text
+待推送。
+```
+
+结果/后续观察：
+
+```text
+重点比较 full/adverse_lighting/adverse_weather 三组 test 指标；如果 full 接近 baseline 且专项提升，说明条件增强方案成立。
+```
+
+## 2026-05-25 baseline 960 config
+
+版本/实验：
+
+```text
+baseline_yolo11m_960
+```
+
+触发问题：
+
+```text
+D fix2 使用 imgsz=960，因此 baseline 也需要按相同图像尺寸和主要训练超参数重跑，避免继续拿旧的 1920 或 640 baseline 做不公平比较。
+```
+
+修复内容：
+
+```text
+1. 新增 configs/train_baseline_960.yaml。
+2. 保持 model=weights/yolo11m.pt、data=configs/waterscenes_full.yaml、imgsz=960、batch=32、optimizer=AdamW、lr0=0.0001、amp=false、seed=42。
+3. 显式关闭 use_uiae/use_eafc/use_mdct/condition_aware_enhancement，确保这是无创新模块 baseline。
+4. 不修改 D 组配置 train_aefc_d.yaml。
+```
+
+涉及文件：
+
+```text
+AEFC-YOLO11/configs/train_baseline_960.yaml
+AEFC-YOLO11/CODE_UPDATE_LOG.md
+```
+
+服务器需要上传：
+
+```text
+configs/train_baseline_960.yaml
+CODE_UPDATE_LOG.md
+```
+
+推荐训练命令：
+
+```bash
+cd ~/autodl-tmp/鲁棒检测-EI/AEFC-YOLO11
+mkdir -p logs
+
+PYTHONPATH="$(pwd):${PYTHONPATH:-}" nohup python tools/train_aefc.py \
+  --cfg configs/train_baseline_960.yaml \
+  --device 0,1,2,3 \
+  --project runs/aefc_yolo11 \
+  --name baseline_yolo11m_960 \
+  --log-dir logs \
+  --log-interval 100 \
+  --log-file logs/baseline_yolo11m_960.log \
+  --save-period -1 \
+  --plots false \
+  > logs/baseline_yolo11m_960.nohup.out 2>&1 &
+```
+
+GitHub 推送备注：
+
+```text
+待推送。
+```
+
+结果/后续观察：
+
+```text
+训练完成后使用同样 imgsz=960 在 full test、adverse_lighting、adverse_weather 上评测。
+```
+
 ## 2026-05-25 AEFC validation loader fix
 
 版本/实验：
